@@ -2,21 +2,14 @@ import os
 import re
 from typing import Any, Dict, Optional
 
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 from playwright.async_api import async_playwright
 
 
-# ====== ENV ======
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.join(BASE_DIR, ".env")
-load_dotenv(ENV_PATH)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-
-# ====== Адреса (у каждой кнопки свой сайт) ======
 ADDRESSES: Dict[str, Dict[str, str]] = {
     "HOME": {
         "label": "💡 Світло — Дім",
@@ -30,9 +23,9 @@ ADDRESSES: Dict[str, Dict[str, str]] = {
         "label": "💡 Світло — Мама",
         "page_url": "https://www.dtek-kem.com.ua/ua/shutdowns",
         "ajax_url": "https://www.dtek-kem.com.ua/ua/ajax",
-        "city": "м. Київ",       # <-- ПОТОМ заменишь на точные
-        "street": "вул. Антоновича",    # <-- ПОТОМ заменишь
-        "house": "88",          # <-- ПОТОМ заменишь
+        "city": "м. Київ",
+        "street": "вул. Антоновича",
+        "house": "88",
     },
 }
 
@@ -42,26 +35,41 @@ def _extract_csrf(html: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _extract_update_timestamp(html: str) -> str:
-    # Пример: updateTimestamp":"22:35 20.02.2026"
-    m = re.search(r'updateTimestamp"\s*:\s*"([^"]+)"', html)
-    return m.group(1) if m else ""
+def _extract_update_fact(html: str) -> str:
+    """
+    DTEK часто кладёт updateFact/updateTimestamp в JS.
+    Ищем максимально “широко”, чтобы не ловить пустую строку.
+    """
+    patterns = [
+        r'updateFact"\s*:\s*"([^"]+)"',
+        r'updateTimestamp"\s*:\s*"([^"]+)"',
+        r'updateFact\s*=\s*"([^"]+)"',
+        r'updateTimestamp\s*=\s*"([^"]+)"',
+    ]
+    for p in patterns:
+        m = re.search(p, html)
+        if m:
+            return m.group(1)
+    return ""
 
 
-async def fetch_current_outage_via_browser(page_url: str, ajax_url: str, city: str, street: str) -> Dict[str, Any]:
+async def fetch_current_outage(page_url: str, ajax_url: str, city: str, street: str) -> Dict[str, Any]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context()
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            )
+        )
         page = await ctx.new_page()
 
-        # 1) Открываем страницу, чтобы получить cookies/защиту
         await page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
         html = await page.content()
 
         csrf = _extract_csrf(html)
-        update_fact = _extract_update_timestamp(html)
+        update_fact = _extract_update_fact(html)
 
-        # 2) POST в ajax как браузер
         headers = {
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With": "XMLHttpRequest",
@@ -83,12 +91,15 @@ async def fetch_current_outage_via_browser(page_url: str, ajax_url: str, city: s
 
         resp = await ctx.request.post(ajax_url, form=form, headers=headers, timeout=60000)
         text = await resp.text()
-
-        # если вдруг пришел HTML
         ct = (resp.headers.get("content-type") or "").lower()
-        if "application/json" not in ct:
+
+        if resp.status != 200:
             await browser.close()
-            raise RuntimeError(f"DTEK повернув НЕ JSON. HTTP={resp.status} CT={ct} TEXT={text[:200]}")
+            raise RuntimeError(f"DTEK HTTP={resp.status} CT={ct} TEXT={text[:250]}")
+
+        if "application/json" not in ct and not text.strip().startswith("{"):
+            await browser.close()
+            raise RuntimeError(f"DTEK повернув НЕ JSON. CT={ct} TEXT={text[:250]}")
 
         data = await resp.json()
         await browser.close()
@@ -149,9 +160,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = ADDRESSES[key]
 
     try:
-        api_json = await fetch_current_outage_via_browser(
-            cfg["page_url"], cfg["ajax_url"], cfg["city"], cfg["street"]
-        )
+        api_json = await fetch_current_outage(cfg["page_url"], cfg["ajax_url"], cfg["city"], cfg["street"])
         msg = format_current_outage(api_json, cfg["house"])
         await q.message.reply_text(f"{cfg['label']}\n\n{msg}")
     except Exception as e:
@@ -160,7 +169,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError(f"BOT_TOKEN не знайдено. Перевір файл: {ENV_PATH}")
+        raise RuntimeError("BOT_TOKEN не знайдено. Додай його в Environment Variables як BOT_TOKEN.")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
