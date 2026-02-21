@@ -195,7 +195,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def main() -> None:
+def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не знайдено. Додай його в Render -> Environment як BOT_TOKEN.")
 
@@ -203,8 +203,9 @@ async def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    await app.run_polling(close_loop=False)
-
+    # главный фикс для Render
+    app.run_polling(stop_signals=None)
+    
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
